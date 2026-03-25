@@ -79,6 +79,12 @@ type DeepSeekConfig = {
   outputParams: DeepSeekOutputParam[];
 };
 
+/** 通义千问（DashScope OpenAI 兼容）配置，字段与 DeepSeek 同源，便于工作流序列化 */
+type QwenConfig = DeepSeekConfig;
+
+const DEFAULT_QWEN_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1";
+const QWEN_MODEL_PRESETS = ["qwen-turbo", "qwen-plus", "qwen-max", "qwen-long", "qwen-flash"] as const;
+
 type FlowNode = Node<{ label: string; nodeType: NodeType }, "workflowNode"> & { meta: WorkflowNodeMeta };
 
 function WorkflowNodeView({ data, isConnectable }: NodeProps<{ label: string; nodeType: NodeType }>) {
@@ -118,11 +124,16 @@ const nodeTypeLabel: Record<NodeType, string> = {
 };
 
 export default function App() {
+  const DEBUG_DRAWER_MIN_HEIGHT = 64;
+  const DEBUG_DRAWER_MIN_OPEN_HEIGHT = 220;
+  const DEBUG_DRAWER_MAX_HEIGHT_RATIO = 0.85;
   const [token, setToken] = useState("");
   const [nodes, setNodes] = useState<FlowNode[]>([]);
   const [edges, setEdges] = useState<Edge[]>([]);
   const [selectedNode, setSelectedNode] = useState<WorkflowNodeMeta | null>(null);
   const [debugOpen, setDebugOpen] = useState(true);
+  const [debugDrawerHeight, setDebugDrawerHeight] = useState(320);
+  const [isResizingDebugDrawer, setIsResizingDebugDrawer] = useState(false);
   const [debugInput, setDebugInput] = useState("你好，帮我生成一期关于 AI Agent 的播客开场白。");
   const [debugResult, setDebugResult] = useState<DebugOutput | null>(null);
   const [loading, setLoading] = useState(false);
@@ -144,16 +155,52 @@ export default function App() {
     inputParams: [],
     outputParams: []
   });
+  const [qwenConfig, setQwenConfig] = useState<QwenConfig>({
+    baseUrl: DEFAULT_QWEN_BASE_URL,
+    apiKey: "",
+    temperature: 0.7,
+    model: "qwen-plus",
+    promptTemplate: "",
+    inputParams: [],
+    outputParams: []
+  });
   const [loadModalOpen, setLoadModalOpen] = useState(false);
   const [workflowsList, setWorkflowsList] = useState<WorkflowDefinitionResponse[]>([]);
   const [workflowsLoading, setWorkflowsLoading] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
   const flowRef = useRef<ReactFlowInstance | null>(null);
+  const debugResizeStartRef = useRef<{ startY: number; startHeight: number } | null>(null);
 
   useEffect(() => {
     void loginAndLoad();
     return () => wsRef.current?.close();
   }, []);
+
+  useEffect(() => {
+    if (!isResizingDebugDrawer) return;
+
+    const onMouseMove = (event: MouseEvent) => {
+      const start = debugResizeStartRef.current;
+      if (!start) return;
+      const delta = start.startY - event.clientY;
+      const next = start.startHeight + delta;
+      const maxHeight = Math.floor(window.innerHeight * DEBUG_DRAWER_MAX_HEIGHT_RATIO);
+      const minHeight = debugOpen ? DEBUG_DRAWER_MIN_OPEN_HEIGHT : DEBUG_DRAWER_MIN_HEIGHT;
+      setDebugDrawerHeight(Math.max(minHeight, Math.min(next, maxHeight)));
+    };
+
+    const onMouseUp = () => {
+      setIsResizingDebugDrawer(false);
+      debugResizeStartRef.current = null;
+    };
+
+    window.addEventListener("mousemove", onMouseMove);
+    window.addEventListener("mouseup", onMouseUp);
+    return () => {
+      window.removeEventListener("mousemove", onMouseMove);
+      window.removeEventListener("mouseup", onMouseUp);
+    };
+  }, [isResizingDebugDrawer, debugOpen]);
 
   async function loginAndLoad(): Promise<void> {
     const loginResp = await fetch(`${API_BASE}/api/auth/login`, {
@@ -247,7 +294,7 @@ export default function App() {
       if (latest.outputText || latest.audioBase64) {
         setDebugResult({
           text: latest.outputText ?? "",
-          audioBase64: latest.audioBase64 ?? null,
+          audioBase64: latest.audioBase64 ?? undefined,
           contentType: "audio/wav"
         });
       } else {
@@ -363,8 +410,15 @@ export default function App() {
   const selectedOutputParams = selectedNode && selectedNode.type === "output" ? outputConfigs[selectedNode.id] || [] : [];
   const selectedOutputTemplate =
     selectedNode && selectedNode.type === "output" ? outputTemplates[selectedNode.id] ?? "{{output}}" : "{{output}}";
+  const isQwenNode =
+    selectedNode?.type === "llm" &&
+    (selectedNode.data?.provider === "dashscope" ||
+      selectedNode.data?.provider === "qwen" ||
+      /通义|千问|qwen/i.test(selectedNode.data?.name ?? ""));
+
   const isDeepSeekNode =
     selectedNode?.type === "llm" &&
+    !isQwenNode &&
     ((selectedNode.data?.name ?? "").toLowerCase().includes("deepseek") ||
       selectedNode.data?.provider === "deepseek" ||
       selectedNode.data?.model === "deepseek-chat");
@@ -408,6 +462,20 @@ export default function App() {
       outputParams: data.outputParams ?? []
     });
   }, [isDeepSeekNode, selectedNode]);
+
+  useEffect(() => {
+    if (!isQwenNode || !selectedNode) return;
+    const data = selectedNode.data ?? {};
+    setQwenConfig({
+      baseUrl: data.baseUrl?.trim() ? data.baseUrl! : DEFAULT_QWEN_BASE_URL,
+      apiKey: data.apiKey ?? "",
+      temperature: typeof data.temperature === "number" ? data.temperature : 0.7,
+      model: data.model?.trim() ? data.model! : "qwen-plus",
+      promptTemplate: data.promptTemplate ?? "",
+      inputParams: data.inputParams ?? [],
+      outputParams: data.outputParams ?? []
+    });
+  }, [isQwenNode, selectedNode]);
 
   function persistSelectedNodeData(nodeId: string, nextData: WorkflowNodeMeta["data"]) {
     setNodes((prev) =>
@@ -465,6 +533,34 @@ export default function App() {
     };
     persistSelectedNodeData(selectedNode.id, payload);
     setLogs((prev) => [...prev, `[CONFIG] DeepSeek config saved for ${selectedNode.id}`]);
+  }
+
+  function saveQwenConfig() {
+    if (!selectedNode) return;
+    const baseUrl = qwenConfig.baseUrl.trim();
+    if (!baseUrl) {
+      alert("请填写 DashScope 兼容模式 API 根地址");
+      return;
+    }
+    const model = qwenConfig.model.trim();
+    if (!model) {
+      alert("请选择或填写模型名称（如 qwen-plus）");
+      return;
+    }
+    const payload: WorkflowNodeMeta["data"] = {
+      ...(selectedNode.data ?? {}),
+      name: selectedNode.data?.name ?? "通义千问",
+      provider: "dashscope",
+      baseUrl,
+      apiKey: qwenConfig.apiKey,
+      temperature: Number(qwenConfig.temperature),
+      model,
+      promptTemplate: qwenConfig.promptTemplate,
+      inputParams: qwenConfig.inputParams,
+      outputParams: qwenConfig.outputParams
+    };
+    persistSelectedNodeData(selectedNode.id, payload);
+    setLogs((prev) => [...prev, `[CONFIG] 通义千问 config saved for ${selectedNode.id}`]);
   }
 
   async function handleDebug(): Promise<void> {
@@ -565,7 +661,7 @@ export default function App() {
     if (exec.outputText || exec.audioBase64) {
       setDebugResult({
         text: exec.outputText ?? "",
-        audioBase64: exec.audioBase64 ?? null,
+        audioBase64: exec.audioBase64 ?? undefined,
         contentType: "audio/wav"
       });
     } else {
@@ -623,11 +719,20 @@ export default function App() {
 
   function appendNodeAt(template: { type: NodeType; label: string }, x: number, y: number) {
     const id = `${template.type}-${crypto.randomUUID().slice(0, 8)}`;
+    const llmProvider =
+      template.type === "llm"
+        ? template.label === "通义千问"
+          ? ("dashscope" as const)
+          : template.label === "DeepSeek"
+            ? ("deepseek" as const)
+            : undefined
+        : undefined;
     const meta: WorkflowNodeMeta = {
       id,
       type: template.type,
       data: {
-        name: template.label
+        name: template.label,
+        ...(llmProvider ? { provider: llmProvider } : {})
       }
     };
     setNodes((prev) => [
@@ -712,6 +817,51 @@ export default function App() {
     }));
   }
 
+  function addQwenInputParam() {
+    setQwenConfig((prev) => ({
+      ...prev,
+      inputParams: [...prev.inputParams, { id: crypto.randomUUID().slice(0, 8), name: "", type: "input", value: "" }]
+    }));
+  }
+
+  function updateQwenInputParam(paramId: string, patch: Partial<DeepSeekInputParam>) {
+    setQwenConfig((prev) => ({
+      ...prev,
+      inputParams: prev.inputParams.map((item) => (item.id === paramId ? { ...item, ...patch } : item))
+    }));
+  }
+
+  function removeQwenInputParam(paramId: string) {
+    setQwenConfig((prev) => ({
+      ...prev,
+      inputParams: prev.inputParams.filter((item) => item.id !== paramId)
+    }));
+  }
+
+  function addQwenOutputParam() {
+    setQwenConfig((prev) => ({
+      ...prev,
+      outputParams: [
+        ...prev.outputParams,
+        { id: crypto.randomUUID().slice(0, 8), name: "", valueType: "string", description: "" }
+      ]
+    }));
+  }
+
+  function updateQwenOutputParam(paramId: string, patch: Partial<DeepSeekOutputParam>) {
+    setQwenConfig((prev) => ({
+      ...prev,
+      outputParams: prev.outputParams.map((item) => (item.id === paramId ? { ...item, ...patch } : item))
+    }));
+  }
+
+  function removeQwenOutputParam(paramId: string) {
+    setQwenConfig((prev) => ({
+      ...prev,
+      outputParams: prev.outputParams.filter((item) => item.id !== paramId)
+    }));
+  }
+
   function deleteNode(nodeId: string) {
     // 同时移除节点本身、与之相连的边，以及该节点的输出配置状态
     if (!confirm("确定删除该节点吗？同时会删除所有连接的边。")) return;
@@ -760,6 +910,13 @@ export default function App() {
       y: event.clientY - bounds.top
     });
     appendNodeAt(template, position.x, position.y);
+  }
+
+  function startResizeDebugDrawer(event: React.MouseEvent<HTMLDivElement>) {
+    event.preventDefault();
+    setDebugOpen(true);
+    debugResizeStartRef.current = { startY: event.clientY, startHeight: debugDrawerHeight };
+    setIsResizingDebugDrawer(true);
   }
 
   return (
@@ -862,7 +1019,10 @@ export default function App() {
                 // applyNodeChanges 只保证 ReactFlow 标准字段更新，
                 // 我们的节点自定义字段 `meta` 需要在更新后继续保留。
                 const metaById = new Map(prev.map((n) => [n.id, n.meta]));
-                return next.map((n) => ({ ...n, meta: metaById.get(n.id) }));
+                return next.map((n) => ({
+                  ...n,
+                  meta: metaById.get(n.id) ?? (n as FlowNode).meta
+                })) as FlowNode[];
               });
             }}
             onNodeClick={(event, node) => {
@@ -988,6 +1148,185 @@ export default function App() {
                     onChange={(e) => setOutputTemplates((prev) => ({ ...prev, [selectedNode.id]: e.target.value }))}
                   />
                   <button className="save-config-btn">保存配置</button>
+                </>
+              ) : isQwenNode ? (
+                <>
+                  <p className="hint">通义千问使用阿里云 DashScope 的 OpenAI 兼容模式（与 OpenAI Chat Completions 一致）</p>
+                  <label className="config-label">API 根地址（必填）</label>
+                  <input
+                    className="config-input"
+                    placeholder={DEFAULT_QWEN_BASE_URL}
+                    value={qwenConfig.baseUrl}
+                    onChange={(e) => setQwenConfig((prev) => ({ ...prev, baseUrl: e.target.value }))}
+                  />
+                  <label className="config-label">DashScope API Key</label>
+                  <input
+                    type="password"
+                    className="config-input"
+                    placeholder="在阿里云百炼控制台创建 API Key"
+                    value={qwenConfig.apiKey}
+                    onChange={(e) => setQwenConfig((prev) => ({ ...prev, apiKey: e.target.value }))}
+                  />
+                  <label className="config-label">模型名称</label>
+                  <select
+                    className="config-input"
+                    value={(QWEN_MODEL_PRESETS as readonly string[]).includes(qwenConfig.model) ? qwenConfig.model : "custom"}
+                    onChange={(e) => {
+                      const v = e.target.value;
+                      if (v === "custom") {
+                        setQwenConfig((prev) => ({
+                          ...prev,
+                          model: (QWEN_MODEL_PRESETS as readonly string[]).includes(prev.model) ? "" : prev.model
+                        }));
+                      } else {
+                        setQwenConfig((prev) => ({ ...prev, model: v }));
+                      }
+                    }}
+                  >
+                    {QWEN_MODEL_PRESETS.map((m) => (
+                      <option key={m} value={m}>
+                        {m}
+                      </option>
+                    ))}
+                    <option value="custom">自定义模型 ID…</option>
+                  </select>
+                  {(!(QWEN_MODEL_PRESETS as readonly string[]).includes(qwenConfig.model) || qwenConfig.model === "") && (
+                    <input
+                      className="config-input"
+                      style={{ marginTop: 8 }}
+                      placeholder="与控制台模型列表一致，例如 qwen3-max"
+                      value={qwenConfig.model}
+                      onChange={(e) => setQwenConfig((prev) => ({ ...prev, model: e.target.value }))}
+                    />
+                  )}
+                  <label className="config-label">输入参数配置</label>
+                  <button className="add-param-btn" onClick={addQwenInputParam}>
+                    ＋ 添加
+                  </button>
+                  <div className="output-table">
+                    {qwenConfig.inputParams.length === 0 ? (
+                      <div className="hint">暂无输入参数，点击“添加”创建</div>
+                    ) : (
+                      qwenConfig.inputParams.map((item) => (
+                        <div className="output-row" key={item.id}>
+                          <input
+                            className="config-input inline-input"
+                            placeholder="参数名"
+                            value={item.name}
+                            onChange={(e) => updateQwenInputParam(item.id, { name: e.target.value })}
+                          />
+                          <select
+                            className="config-input inline-input"
+                            value={item.type}
+                            onChange={(e) =>
+                              updateQwenInputParam(item.id, { type: e.target.value as DeepSeekInputParamType, value: "" })
+                            }
+                          >
+                            <option value="input">输入</option>
+                            <option value="reference">引用</option>
+                          </select>
+                          {item.type === "input" ? (
+                            <input
+                              className="config-input inline-input"
+                              placeholder="请输入值"
+                              value={item.value}
+                              onChange={(e) => updateQwenInputParam(item.id, { value: e.target.value })}
+                            />
+                          ) : (
+                            <select
+                              className="config-input inline-input"
+                              value={item.value}
+                              onChange={(e) => updateQwenInputParam(item.id, { value: e.target.value })}
+                            >
+                              <option value="">选择引用</option>
+                              {deepSeekReferenceOptions.map((option) => (
+                                <option key={option.value} value={option.value}>
+                                  {option.label}
+                                </option>
+                              ))}
+                            </select>
+                          )}
+                          <button className="remove-btn" onClick={() => removeQwenInputParam(item.id)}>
+                            移除
+                          </button>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                  <label className="config-label">提示词模板</label>
+                  <textarea
+                    className="config-area"
+                    placeholder={"# 角色\n你是一位专业的广播节目编辑...\n# 原始内容：{{input}}"}
+                    value={qwenConfig.promptTemplate}
+                    onChange={(e) => setQwenConfig((prev) => ({ ...prev, promptTemplate: e.target.value }))}
+                  />
+                  <div className="template-help">
+                    {qwenConfig.inputParams.map((item) => (
+                      <button
+                        key={item.id}
+                        className="chip"
+                        onClick={() =>
+                          setQwenConfig((prev) => ({
+                            ...prev,
+                            promptTemplate: `${prev.promptTemplate}{{${item.name || "参数名"}}}`
+                          }))
+                        }
+                      >
+                        {`{{${item.name || "参数名"}}}`}
+                      </button>
+                    ))}
+                  </div>
+                  <label className="config-label">输出参数配置</label>
+                  <button className="add-param-btn" onClick={addQwenOutputParam}>
+                    ＋ 添加
+                  </button>
+                  <div className="output-table">
+                    {qwenConfig.outputParams.length === 0 ? (
+                      <div className="hint">暂无输出参数，点击“添加”创建</div>
+                    ) : (
+                      qwenConfig.outputParams.map((item) => (
+                        <div className="output-row" key={item.id}>
+                          <input
+                            className="config-input inline-input"
+                            placeholder="变量名"
+                            value={item.name}
+                            onChange={(e) => updateQwenOutputParam(item.id, { name: e.target.value })}
+                          />
+                          <select
+                            className="config-input inline-input"
+                            value={item.valueType}
+                            onChange={(e) => updateQwenOutputParam(item.id, { valueType: e.target.value as "string" })}
+                          >
+                            <option value="string">string</option>
+                          </select>
+                          <input
+                            className="config-input inline-input"
+                            placeholder="描述（可为空）"
+                            value={item.description}
+                            onChange={(e) => updateQwenOutputParam(item.id, { description: e.target.value })}
+                          />
+                          <button className="remove-btn" onClick={() => removeQwenOutputParam(item.id)}>
+                            移除
+                          </button>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                  <label className="config-label">温度（temperature）</label>
+                  <input
+                    type="range"
+                    min={0}
+                    max={2}
+                    step={0.1}
+                    value={qwenConfig.temperature}
+                    onChange={(e) => setQwenConfig((prev) => ({ ...prev, temperature: Number(e.target.value) }))}
+                  />
+                  <div className="temp-tip">
+                    当前值：{qwenConfig.temperature.toFixed(1)}。温度越低越严谨，越高越发散。
+                  </div>
+                  <button className="save-config-btn" onClick={saveQwenConfig}>
+                    保存配置
+                  </button>
                 </>
               ) : isDeepSeekNode ? (
                 <>
@@ -1188,7 +1527,15 @@ export default function App() {
         </div>
       )}
 
-      <section className={`debug-drawer ${debugOpen ? "open" : ""}`}>
+      <section
+        className={`debug-drawer ${debugOpen ? "open" : ""} ${isResizingDebugDrawer ? "resizing" : ""}`}
+        style={{ height: debugOpen ? debugDrawerHeight : DEBUG_DRAWER_MIN_HEIGHT }}
+      >
+        <div
+          className="debug-resize-handle"
+          onMouseDown={startResizeDebugDrawer}
+          title="拖动调节调试框高度"
+        />
         <div className="debug-header">
           <strong>调试抽屉</strong>
           <button className="toggle-btn" onClick={() => setDebugOpen((v) => !v)}>

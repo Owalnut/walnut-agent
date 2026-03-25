@@ -343,22 +343,37 @@ public class WorkflowService {
         return prompt;
     }
 
+    private static String defaultLlmModel(String provider) {
+        if (provider == null || provider.isBlank()) {
+            return "deepseek-chat";
+        }
+        String p = provider.trim().toLowerCase(Locale.ROOT);
+        if ("dashscope".equals(p) || "qwen".equals(p)) {
+            return "qwen-plus";
+        }
+        return "deepseek-chat";
+    }
+
     private String callLlm(WorkflowDtos.Node node, String prompt) throws Exception {
         WorkflowDtos.NodeData data = node.data();
         String baseUrl = data == null ? null : data.baseUrl();
         String apiKey = data == null ? null : data.apiKey();
-        String model = data == null || data.model() == null || data.model().isBlank() ? "deepseek-chat" : data.model();
+        String provider = data == null ? null : data.provider();
+        String model =
+                data == null || data.model() == null || data.model().isBlank()
+                        ? defaultLlmModel(provider)
+                        : data.model();
         Double temperature = data == null || data.temperature() == null ? 0.7 : data.temperature();
 
         if (baseUrl == null || baseUrl.isBlank()) {
-            throw new WorkflowNodeException("NODE_CONFIG_ERROR", "FAILED", "DeepSeek baseUrl is required", null);
+            throw new WorkflowNodeException("NODE_CONFIG_ERROR", "FAILED", "LLM baseUrl is required", null);
         }
         if (apiKey == null || apiKey.isBlank()) {
-            throw new WorkflowNodeException("NODE_CONFIG_ERROR", "FAILED", "DeepSeek apiKey is required", null);
+            throw new WorkflowNodeException("NODE_CONFIG_ERROR", "FAILED", "LLM apiKey is required", null);
         }
         try {
             log.info(
-                    "DeepSeek node execute: baseUrl={}, model={}, temperature={}, promptLen={}",
+                    "LLM node execute: baseUrl={}, model={}, temperature={}, promptLen={}",
                     baseUrl,
                     model,
                     temperature,
@@ -369,20 +384,20 @@ public class WorkflowService {
                     .user(prompt == null ? "" : prompt)
                     .call()
                     .content();
-            log.info("DeepSeek node response: contentLen={}", content == null ? 0 : content.length());
+            log.info("LLM node response: contentLen={}", content == null ? 0 : content.length());
             if (content == null || content.isBlank()) {
-                throw new WorkflowNodeException("LLM_EMPTY_RESPONSE", "FAILED", "DeepSeek returned empty content", null);
+                throw new WorkflowNodeException("LLM_EMPTY_RESPONSE", "FAILED", "LLM returned empty content", null);
             }
             return content;
         } catch (WorkflowNodeException e) {
-            log.warn("DeepSeek node failed (known error): code={}, status={}, message={}", e.code(), e.status(), e.getMessage());
+            log.warn("LLM node failed (known error): code={}, status={}, message={}", e.code(), e.status(), e.getMessage());
             throw e;
         } catch (Exception e) {
-            log.error("DeepSeek node provider error: root={}", getRootMessage(e));
+            log.error("LLM provider error: root={}", getRootMessage(e));
             throw new WorkflowNodeException(
                     "LLM_PROVIDER_ERROR",
                     "FAILED",
-                    "Spring AI DeepSeek call failed: " + getRootMessage(e),
+                    "Spring AI LLM call failed: " + getRootMessage(e),
                     e
             );
         }

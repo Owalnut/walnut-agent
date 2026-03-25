@@ -291,6 +291,34 @@ body,
   border: 1px solid #e6e9f3;
   border-radius: 12px;
   padding: 10px 12px;
+  overflow: hidden;
+  min-height: 64px;
+  position: relative;
+}
+
+.debug-drawer.resizing {
+  user-select: none;
+}
+
+.debug-resize-handle {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  height: 8px;
+  cursor: ns-resize;
+}
+
+.debug-resize-handle::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 2px;
+  transform: translateX(-50%);
+  width: 72px;
+  height: 4px;
+  border-radius: 999px;
+  background: #d3dae9;
 }
 
 .modal-overlay {
@@ -494,6 +522,7 @@ body,
   display: flex;
   justify-content: space-between;
   align-items: center;
+  margin-top: 4px;
 }
 
 .toggle-btn,
