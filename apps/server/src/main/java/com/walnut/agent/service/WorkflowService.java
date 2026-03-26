@@ -17,6 +17,10 @@ import org.springframework.web.server.ResponseStatusException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.time.LocalDateTime;
@@ -28,6 +32,7 @@ import java.util.concurrent.ExecutionException;
 @Service
 public class WorkflowService {
     private static final Logger log = LoggerFactory.getLogger(WorkflowService.class);
+    private static final String DASHSCOPE_TTS_ENDPOINT = "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation";
     private final WorkflowDefinitionMapper definitionMapper;
     private final WorkflowExecutionMapper executionMapper;
     private final ObjectMapper objectMapper;
@@ -36,6 +41,7 @@ public class WorkflowService {
     private final long retryBackoffMs;
     private final int retryBackoffMultiplier;
     private final ChatClientFactory chatClientFactory;
+    private final HttpClient httpClient;
 
     public WorkflowService(
             WorkflowDefinitionMapper definitionMapper,
@@ -55,6 +61,7 @@ public class WorkflowService {
         this.retryTimes = retryTimes;
         this.retryBackoffMs = retryBackoffMs;
         this.retryBackoffMultiplier = retryBackoffMultiplier;
+        this.httpClient = HttpClient.newBuilder().build();
     }
 
     public WorkflowDtos.WorkflowDefinitionResponse saveWorkflow(WorkflowDtos.SaveWorkflowRequest req) {
@@ -252,7 +259,7 @@ public class WorkflowService {
                 continue;
             }
             Map<String, String> prev = findIncomingValue(node.id(), graph.edges(), values);
-            if (!"llm".equals(node.type())) {
+            if (!"llm".equals(node.type()) && !"tool_tts".equals(node.type())) {
                 emit(eventConsumer, "NODE_START", executionId, Map.of(
                         "nodeId", node.id(),
                         "nodeType", node.type(),
@@ -307,19 +314,71 @@ public class WorkflowService {
                     throw e;
                 }
             } else if ("tool_tts".equals(node.type())) {
-                String text = prev.getOrDefault("text", "");
+                WorkflowDtos.NodeData data = node.data();
+                String apiKey = data == null ? null : data.apiKey();
+                String model = data == null || data.model() == null || data.model().isBlank() ? "qwen3-tts-flash" : data.model();
+                Map<String, String> paramValues = new HashMap<>();
+                if (data != null && data.inputParams() != null) {
+                    for (WorkflowDtos.NodeInputParam param : data.inputParams()) {
+                        if (param == null || param.name() == null || param.name().isBlank()) continue;
+                        String value = resolveInputParamValue(param, values);
+                        paramValues.put(param.name(), value == null ? "" : value);
+                    }
+                }
+
+                String textForTts = paramValues.getOrDefault("text", prev.getOrDefault("text", ""));
+                if (textForTts == null || textForTts.isBlank()) {
+                    textForTts = prev.getOrDefault("text", "");
+                }
+                String voice = paramValues.getOrDefault("voice", "Cherry");
+                String languageType = paramValues.getOrDefault("language_type", "Auto");
+                final String ttsText = textForTts;
+                final String ttsVoice = voice;
+                final String ttsLanguageType = languageType;
+
+                if (apiKey == null || apiKey.isBlank()) {
+                    throw new WorkflowNodeException("NODE_CONFIG_ERROR", "FAILED", "TTS apiKey is required", null);
+                }
+                if (ttsText == null || ttsText.isBlank()) {
+                    throw new WorkflowNodeException("NODE_CONFIG_ERROR", "FAILED", "TTS text is required", null);
+                }
+
+                Map<String, String> nodeInputPayload = Map.of(
+                        "text", textForTts,
+                        "voice", voice,
+                        "language_type", languageType
+                );
                 long startMs = System.currentTimeMillis();
                 try {
-                    byte[] wav = executeWithRetry(() -> runWithTimeout(() -> generateSimpleWav()));
-                    Map<String, String> nodeOutput = Map.of(
-                            "text", text,
-                            "audioBase64", Base64.getEncoder().encodeToString(wav),
-                            "contentType", "audio/wav"
-                    );
+                    emit(eventConsumer, "NODE_START", executionId, Map.of(
+                            "nodeId", node.id(),
+                            "nodeType", node.type(),
+                            "inputPayload", toJson(nodeInputPayload)
+                    ));
+                    Map<String, String> nodeOutput = executeWithRetry(new Callable<Map<String, String>>() {
+                        @Override
+                        public Map<String, String> call() throws Exception {
+                            return runWithTimeout(new Callable<Map<String, String>>() {
+                                @Override
+                                public Map<String, String> call() throws Exception {
+                                    return callDashScopeTts(apiKey, model, ttsText, ttsVoice, ttsLanguageType);
+                                }
+                            });
+                        }
+                    });
                     values.put(node.id(), nodeOutput);
                     long dur = Math.max(0, System.currentTimeMillis() - startMs);
                     nodeResults.add(new WorkflowDtos.NodeResult(
-                            node.id(), node.type(), "SUCCESS", dur, text, null, toJson(prev), toJson(nodeOutput), null, null
+                            node.id(),
+                            node.type(),
+                            "SUCCESS",
+                            dur,
+                            ttsText,
+                            null,
+                            toJson(nodeInputPayload),
+                            toJson(nodeOutput),
+                            null,
+                            null
                     ));
                     emit(eventConsumer, "NODE_SUCCESS", executionId, Map.of(
                             "nodeId", node.id(),
@@ -329,7 +388,16 @@ public class WorkflowService {
                 } catch (WorkflowNodeException e) {
                     long dur = Math.max(0, System.currentTimeMillis() - startMs);
                     nodeResults.add(new WorkflowDtos.NodeResult(
-                            node.id(), node.type(), e.status(), dur, null, e.code(), toJson(prev), null, null, null
+                            node.id(),
+                            node.type(),
+                            e.status(),
+                            dur,
+                            null,
+                            e.code(),
+                            toJson(nodeInputPayload),
+                            null,
+                            null,
+                            null
                     ));
                     emit(eventConsumer, "NODE_ERROR", executionId, Map.of("nodeId", node.id(), "nodeType", node.type(), "errorCode", e.code(), "message", e.getMessage()));
                     throw e;
@@ -516,7 +584,9 @@ public class WorkflowService {
                         ("NODE_CONFIG_ERROR".equals(wne.code())
                                 || "LLM_PROVIDER_ERROR".equals(wne.code())
                                 || "LLM_EMPTY_RESPONSE".equals(wne.code())
-                                || "LLM_RESPONSE_PARSE_ERROR".equals(wne.code()))) {
+                                || "LLM_RESPONSE_PARSE_ERROR".equals(wne.code())
+                                || "TTS_PROVIDER_ERROR".equals(wne.code())
+                                || "TTS_EMPTY_RESPONSE".equals(wne.code()))) {
                     throw wne;
                 }
                 last = e;
@@ -632,18 +702,109 @@ public class WorkflowService {
         }
     }
 
-    private byte[] generateSimpleWav() {
+    private byte[] generateSimpleWav(String text, String voice, String languageType) {
         int sampleRate = 16000;
         int durationMs = 800;
         int totalSamples = sampleRate * durationMs / 1000;
         byte[] pcm = new byte[totalSamples * 2];
-        double frequency = 440.0;
+        String safeText = text == null ? "" : text;
+        String safeVoice = voice == null ? "Cherry" : voice.trim();
+        String safeLang = languageType == null ? "Auto" : languageType.trim();
+
+        double baseFrequency;
+        switch (safeVoice) {
+            case "Serena":
+                baseFrequency = 554.0;
+                break;
+            case "Ethan":
+                baseFrequency = 659.0;
+                break;
+            case "Cherry":
+            default:
+                baseFrequency = 440.0;
+                break;
+        }
+
+        // 用文本做一个轻量的可重复扰动，确保不同 text/参数能听出差异
+        int hash = safeText.hashCode();
+        double textOffset = (Math.abs(hash) % 2000) / 200.0; // 0 ~ 9.995
+
+        // languageType 目前只做轻微扰动（Auto -> 0）
+        double langOffset = "Auto".equalsIgnoreCase(safeLang) ? 0.0 : 1.0;
+
+        double frequency = baseFrequency + textOffset + langOffset;
         for (int i = 0; i < totalSamples; i++) {
             short value = (short) (Math.sin(2 * Math.PI * frequency * i / sampleRate) * 32767 * 0.2);
             pcm[i * 2] = (byte) (value & 0xff);
             pcm[i * 2 + 1] = (byte) ((value >> 8) & 0xff);
         }
         return wavWrap(pcm, sampleRate, 1, 16);
+    }
+
+    private Map<String, String> callDashScopeTts(
+            String apiKey,
+            String model,
+            String text,
+            String voice,
+            String languageType
+    ) {
+        try {
+            Map<String, Object> body = Map.of(
+                    "model", model == null || model.isBlank() ? "qwen3-tts-flash" : model,
+                    "input", Map.of(
+                            "text", text == null ? "" : text,
+                            "voice", voice == null || voice.isBlank() ? "Cherry" : voice,
+                            "language_type", languageType == null || languageType.isBlank() ? "Auto" : languageType
+                    )
+            );
+            String reqJson = objectMapper.writeValueAsString(body);
+            HttpRequest req = HttpRequest.newBuilder()
+                    .uri(URI.create(DASHSCOPE_TTS_ENDPOINT))
+                    .header("Authorization", "Bearer " + apiKey.trim())
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(reqJson))
+                    .build();
+
+            HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
+            if (resp.statusCode() < 200 || resp.statusCode() >= 300) {
+                throw new WorkflowNodeException(
+                        "TTS_PROVIDER_ERROR",
+                        "FAILED",
+                        "DashScope TTS http error: " + resp.statusCode(),
+                        null
+                );
+            }
+
+            Map<String, Object> respMap = objectMapper.readValue(resp.body(), new TypeReference<Map<String, Object>>() {});
+            Map<String, Object> output = asMap(respMap.get("output"));
+            Map<String, Object> audio = asMap(output.get("audio"));
+            String voiceUrl = asString(audio.get("url"));
+            String audioData = asString(audio.get("data"));
+            if (voiceUrl == null || voiceUrl.isBlank()) {
+                throw new WorkflowNodeException("TTS_EMPTY_RESPONSE", "FAILED", "DashScope TTS returned empty voice url", null);
+            }
+            Map<String, String> result = new HashMap<>();
+            result.put("text", text == null ? "" : text);
+            result.put("voice_url", voiceUrl);
+            result.put("contentType", "audio/wav");
+            if (audioData != null && !audioData.isBlank()) {
+                result.put("audioBase64", audioData);
+            }
+            return result;
+        } catch (WorkflowNodeException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new WorkflowNodeException("TTS_PROVIDER_ERROR", "FAILED", "DashScope TTS call failed: " + getRootMessage(e), e);
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> asMap(Object val) {
+        return val instanceof Map ? (Map<String, Object>) val : Map.of();
+    }
+
+    private String asString(Object val) {
+        return val == null ? null : String.valueOf(val);
     }
 
     private byte[] wavWrap(byte[] pcm, int sampleRate, int channels, int bitsPerSample) {

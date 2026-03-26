@@ -85,6 +85,7 @@ type DeepSeekConfig = {
 
 /** 通义千问（DashScope OpenAI 兼容）配置，字段与 DeepSeek 同源，便于工作流序列化 */
 type QwenConfig = DeepSeekConfig;
+type TtsNodeConfig = { apiKey: string; model: string };
 
 const DEFAULT_QWEN_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1";
 const QWEN_MODEL_PRESETS = ["qwen-turbo", "qwen-plus", "qwen-max", "qwen-long", "qwen-flash"] as const;
@@ -169,6 +170,17 @@ export default function App() {
     inputParams: [],
     outputParams: []
   });
+  const [ttsNodeConfig, setTtsNodeConfig] = useState<TtsNodeConfig>({
+    apiKey: "",
+    model: "qwen3-tts-flash"
+  });
+
+  const TTS_VOICE_OPTIONS = ["Cherry", "Serena", "Ethan"] as const;
+  const [ttsTextParamType, setTtsTextParamType] = useState<DeepSeekInputParamType>("input");
+  const [ttsTextParamValue, setTtsTextParamValue] = useState<string>("");
+  const [ttsVoice, setTtsVoice] = useState<(typeof TTS_VOICE_OPTIONS)[number]>("Cherry");
+  const [ttsLanguageType, setTtsLanguageType] = useState<string>("Auto");
+  const [ttsOutputVoiceUrlEnabled, setTtsOutputVoiceUrlEnabled] = useState<boolean>(true);
   const [configSaveFeedback, setConfigSaveFeedback] = useState<{ kind: "success" | "error"; text: string } | null>(
     null
   );
@@ -434,6 +446,15 @@ export default function App() {
   const selectedOutputParams = selectedNode && selectedNode.type === "output" ? outputConfigs[selectedNode.id] || [] : [];
   const selectedOutputTemplate =
     selectedNode && selectedNode.type === "output" ? outputTemplates[selectedNode.id] ?? "{{output}}" : "{{output}}";
+  const activeOutputNodeId = useMemo(() => {
+    const outputNode = nodes.find((n) => ((n as unknown as { meta?: WorkflowNodeMeta }).meta?.type ?? n.data.nodeType) === "output");
+    return outputNode?.id ?? null;
+  }, [nodes]);
+  const activeOutputTemplate = activeOutputNodeId ? outputTemplates[activeOutputNodeId] ?? "{{output}}" : "{{output}}";
+  const outputTemplateWantsAudioPlayer = /<source\s+[^>]*src\s*=\s*["']\{\{output\}\}["'][^>]*type\s*=\s*["']audio\/mpeg["'][^>]*>/i.test(
+    activeOutputTemplate
+  );
+  const isTtsNode = selectedNode?.type === "tool_tts";
   const isQwenNode =
     selectedNode?.type === "llm" &&
     (selectedNode.data?.provider === "dashscope" ||
@@ -456,7 +477,8 @@ export default function App() {
       })
       .flatMap((n) => [
         { label: `${n.data.label}.text`, value: `${n.id}.text` },
-        { label: `${n.data.label}.audioBase64`, value: `${n.id}.audioBase64` }
+        { label: `${n.data.label}.audioBase64`, value: `${n.id}.audioBase64` },
+        { label: `${n.data.label}.voice_url`, value: `${n.id}.voice_url` }
       ]);
   }, [nodes]);
 
@@ -469,9 +491,74 @@ export default function App() {
       .filter((n) => previousNodeIds.has(n.id))
       .flatMap((n) => [
         { label: `${n.data.label}.text`, value: `${n.id}.text` },
-        { label: `${n.data.label}.audioBase64`, value: `${n.id}.audioBase64` }
+        { label: `${n.data.label}.audioBase64`, value: `${n.id}.audioBase64` },
+        { label: `${n.data.label}.voice_url`, value: `${n.id}.voice_url` }
       ]);
   }, [edges, nodes, selectedNode]);
+
+  const ttsTextReferenceOptions = useMemo(() => {
+    return deepSeekReferenceOptions.filter((o) => o.value.endsWith(".text"));
+  }, [deepSeekReferenceOptions]);
+
+  function parseObjectJson(input?: string | null): Record<string, unknown> | null {
+    if (!input) return null;
+    try {
+      const obj = JSON.parse(input);
+      return obj && typeof obj === "object" ? (obj as Record<string, unknown>) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function extractVoiceUrlFromNodeResults(results?: NodeResult[] | null): string | null {
+    if (!results || !results.length) return null;
+    for (let i = results.length - 1; i >= 0; i--) {
+      const payload = parseObjectJson(results[i].outputPayload);
+      const voiceUrl = payload?.voice_url;
+      if (typeof voiceUrl === "string" && voiceUrl.trim()) return voiceUrl.trim();
+    }
+    return null;
+  }
+
+  const finalVoiceUrl = useMemo(() => {
+    return extractVoiceUrlFromNodeResults(latestExecution?.nodeResults) || extractVoiceUrlFromNodeResults(liveNodeResults);
+  }, [latestExecution?.nodeResults, liveNodeResults]);
+  const finalAudioSrc =
+    finalVoiceUrl ||
+    (debugResult?.audioBase64 ? `data:${debugResult?.contentType || "audio/wav"};base64,${debugResult.audioBase64}` : null);
+
+  useEffect(() => {
+    if (!isTtsNode || !selectedNode) return;
+    const data = selectedNode.data ?? {};
+    setTtsNodeConfig({
+      apiKey: data.apiKey ?? "",
+      model: data.model?.trim() ? data.model : "qwen3-tts-flash"
+    });
+
+    const params = data.inputParams ?? [];
+    const textParam = params.find((p) => p?.name === "text");
+    const voiceParam = params.find((p) => p?.name === "voice");
+    const langParam = params.find((p) => p?.name === "language_type");
+
+    if (textParam?.type === "reference") {
+      setTtsTextParamType("reference");
+      setTtsTextParamValue(textParam.value ?? "");
+    } else {
+      setTtsTextParamType("input");
+      setTtsTextParamValue(textParam?.value ?? "");
+    }
+
+    if (voiceParam?.value && TTS_VOICE_OPTIONS.includes(voiceParam.value as any)) {
+      setTtsVoice(voiceParam.value as (typeof TTS_VOICE_OPTIONS)[number]);
+    } else {
+      setTtsVoice("Cherry");
+    }
+
+    setTtsLanguageType(langParam?.value?.trim() ? langParam.value : "Auto");
+
+    const outputVoiceUrl = (data.outputParams ?? []).find((p) => p?.name === "voice_url");
+    setTtsOutputVoiceUrlEnabled(!!outputVoiceUrl || (data.outputParams ?? []).length === 0);
+  }, [isTtsNode, selectedNode]);
 
   useEffect(() => {
     if (!isDeepSeekNode || !selectedNode) return;
@@ -688,6 +775,64 @@ export default function App() {
       const msg = e instanceof Error ? e.message : String(e);
       setLogs((prev) => [...prev, `[CONFIG] 通义千问 config save failed: ${msg}`]);
       showConfigSaveFeedback("error", `通义千问配置保存失败：${msg}`);
+    }
+  }
+
+  async function saveTtsNodeConfig() {
+    if (!selectedNode) return;
+    const apiKey = ttsNodeConfig.apiKey.trim();
+    if (!apiKey) {
+      showConfigSaveFeedback("error", "超拟人音频节点配置保存失败：API Key 必填");
+      return;
+    }
+    const model = ttsNodeConfig.model.trim() || "qwen3-tts-flash";
+    const inputParams: DeepSeekInputParam[] = [
+      {
+        id: crypto.randomUUID().slice(0, 8),
+        name: "text",
+        type: ttsTextParamType,
+        value: ttsTextParamValue
+      },
+      {
+        id: crypto.randomUUID().slice(0, 8),
+        name: "voice",
+        type: "input" as DeepSeekInputParamType,
+        value: ttsVoice
+      },
+      {
+        id: crypto.randomUUID().slice(0, 8),
+        name: "language_type",
+        type: "input" as DeepSeekInputParamType,
+        value: ttsLanguageType
+      }
+    ];
+    const payload: WorkflowNodeMeta["data"] = {
+      ...(selectedNode.data ?? {}),
+      name: selectedNode.data?.name ?? "超拟人音频合成",
+      provider: "dashscope",
+      apiKey,
+      model,
+      inputParams,
+      outputParams: ttsOutputVoiceUrlEnabled
+        ? [{ id: crypto.randomUUID().slice(0, 8), name: "voice_url", valueType: "string", description: "音频地址" }]
+        : []
+    };
+    const nextNodes = computeNodesWithUpdatedMeta(selectedNode.id, payload);
+    setNodes(nextNodes);
+    setSelectedNode((prev) => {
+      if (!prev || prev.id !== selectedNode.id) return prev;
+      return { ...prev, data: { ...(prev.data ?? {}), ...(payload ?? {}) } };
+    });
+    const nextWorkflowPayload = buildWorkflowPayloadFromNodes(nextNodes);
+    const workflowName = currentWorkflowName || `workflow-${Date.now()}`;
+    try {
+      await upsertWorkflowToDb(workflowName, nextWorkflowPayload);
+      setLogs((prev) => [...prev, `[CONFIG] TTS config saved for ${selectedNode.id}`]);
+      showConfigSaveFeedback("success", "超拟人音频节点配置已保存并落库");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setLogs((prev) => [...prev, `[CONFIG] TTS config save failed: ${msg}`]);
+      showConfigSaveFeedback("error", `超拟人音频节点配置保存失败：${msg}`);
     }
   }
 
@@ -1335,6 +1480,118 @@ export default function App() {
                     </div>
                   )}
                 </>
+              ) : isTtsNode ? (
+                <>
+                  <label className="config-label">基本信息配置</label>
+                  <label className="config-label">API Key（必填）</label>
+                  <input
+                    type="password"
+                    className="config-input"
+                    placeholder="请输入音频服务 API Key"
+                    value={ttsNodeConfig.apiKey}
+                    onChange={(e) => setTtsNodeConfig((prev) => ({ ...prev, apiKey: e.target.value }))}
+                  />
+                  <label className="config-label">模型名称</label>
+                  <input
+                    className="config-input"
+                    value={ttsNodeConfig.model}
+                    onChange={(e) => setTtsNodeConfig((prev) => ({ ...prev, model: e.target.value }))}
+                    placeholder="qwen3-tts-flash"
+                  />
+                  <label className="config-label">输入参数配置</label>
+
+                  <div className="tts-param-row">
+                    <div className="tts-param-name">text</div>
+                    <div className="tts-param-controls">
+                      <select
+                        className="config-input inline-input tts-type-select"
+                        value={ttsTextParamType}
+                        onChange={(e) => {
+                          const v = e.target.value as DeepSeekInputParamType;
+                          setTtsTextParamType(v);
+                          // type 切换后不强制清空 value，便于你来回切换和引用
+                        }}
+                      >
+                        <option value="input">输入</option>
+                        <option value="reference">引用</option>
+                      </select>
+                      {ttsTextParamType === "input" ? (
+                        <input
+                          className="config-input tts-flex-1"
+                          placeholder="请输入要朗读的文本"
+                          value={ttsTextParamValue}
+                          onChange={(e) => setTtsTextParamValue(e.target.value)}
+                        />
+                      ) : (
+                        <select
+                          className="config-input tts-flex-1"
+                          value={ttsTextParamValue}
+                          onChange={(e) => setTtsTextParamValue(e.target.value)}
+                        >
+                          <option value="">选择引用</option>
+                          {ttsTextReferenceOptions.map((option) => (
+                            <option key={option.value} value={option.value}>
+                              {option.label}
+                            </option>
+                          ))}
+                        </select>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="tts-param-row">
+                    <div className="tts-param-name">voice</div>
+                    <div className="tts-param-controls">
+                      <select
+                        className="config-input tts-flex-1"
+                        value={ttsVoice}
+                        onChange={(e) => setTtsVoice(e.target.value as (typeof TTS_VOICE_OPTIONS)[number])}
+                      >
+                        {TTS_VOICE_OPTIONS.map((v) => (
+                          <option key={v} value={v}>
+                            {v}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+
+                  <div className="tts-param-row">
+                    <div className="tts-param-name">language_type</div>
+                    <div className="tts-param-controls">
+                      <select
+                        className="config-input tts-flex-1"
+                        value={ttsLanguageType}
+                        onChange={(e) => setTtsLanguageType(e.target.value)}
+                      >
+                        <option value="Auto">Auto</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  <label className="config-label">输出配置</label>
+                  <label className="required-row">
+                    <input
+                      type="checkbox"
+                      checked={ttsOutputVoiceUrlEnabled}
+                      onChange={(e) => setTtsOutputVoiceUrlEnabled(e.target.checked)}
+                    />
+                    <span>voice_url</span>
+                  </label>
+
+                  <button className="save-config-btn" onClick={() => void saveTtsNodeConfig()}>
+                    保存配置
+                  </button>
+                  {configSaveFeedback && (
+                    <div
+                      className={`config-save-feedback ${
+                        configSaveFeedback.kind === "success" ? "success" : "error"
+                      }`}
+                    >
+                      {configSaveFeedback.text}
+                    </div>
+                  )}
+                </>
               ) : isQwenNode ? (
                 <>
                   <p className="hint">通义千问使用阿里云 DashScope 的 OpenAI 兼容模式（与 OpenAI Chat Completions 一致）</p>
@@ -1819,7 +2076,14 @@ export default function App() {
               </div>
 
               <div className="exec-audio">
-                音频状态: {debugResult?.audioBase64 ? "已返回音频并自动播放" : "未返回音频"}
+                音频状态: {finalAudioSrc ? "已返回音频资源" : "未返回音频"}
+                {finalAudioSrc ? (
+                  <div style={{ marginTop: 8 }}>
+                    <audio controls preload="none" src={finalAudioSrc} style={{ width: "100%" }}>
+                      你的浏览器不支持 audio 标签
+                    </audio>
+                  </div>
+                ) : null}
               </div>
             </div>
           </div>

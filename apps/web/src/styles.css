@@ -443,6 +443,33 @@ body,
   gap: 8px;
 }
 
+.tts-param-row {
+  display: grid;
+  grid-template-columns: 140px 1fr;
+  gap: 8px;
+  align-items: center;
+}
+
+.tts-param-name {
+  font-size: 13px;
+  color: #707d95;
+}
+
+.tts-param-controls {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.tts-flex-1 {
+  flex: 1;
+}
+
+.tts-type-select {
+  width: 120px;
+  flex: 0 0 120px;
+}
+
 .exec-raw summary {
   cursor: pointer;
   color: #374151;
